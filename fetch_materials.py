@@ -44,11 +44,15 @@ def fetch_materials():
                 logger.info(f"Found {len(existing_ids)} existing materials.")
             except Exception as e:
                 logger.warning(f"Could not read existing file: {e}. Starting fresh.")
+                # If reading fails, maybe backup and start fresh?
+                # For now, we assume if it fails we might just append or overwrite if empty
         else:
             # Initialize working file with headers including ID
             headers = [
                 "Material ID", "Formula", "Sites", "Energy above Hull", "Formation Energy",
-                "Predicted Stable", "Volume", "Density", "Band Gap"
+                "Predicted Stable", "Volume", "Density", "Band Gap",
+                "Bulk Modulus Voigt", "Bulk Modulus Reuss", "Bulk Modulus VRH",
+                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH"
             ]
             pd.DataFrame(columns=headers).to_csv(WORKING_FILE, index=False)
 
@@ -61,7 +65,7 @@ def fetch_materials():
                 logger.info(f"Fetching materials with {n} elements...")
 
                 try:
-                    # Fetch IDs only for this group
+                    # Fetch IDs only for this group using summary endpoint
                     docs = mpr.materials.summary.search(
                         num_elements=(n, n),
                         fields=["material_id"]
@@ -81,6 +85,10 @@ def fetch_materials():
                     logger.info(f"Found {len(all_ids)} materials, {len(new_ids)} new to fetch.")
 
                     # Process in chunks
+                    # We need summary fields AND elasticity fields.
+                    # The summary endpoint contains elasticity data in the 'elasticity' field or flattened fields?
+                    # Based on tests, summary doc has `bulk_modulus` and `shear_modulus` as keys which contain the Voigt/Reuss/VRH values in a dictionary.
+
                     fields = [
                         "material_id",
                         "formula_pretty",
@@ -90,13 +98,17 @@ def fetch_materials():
                         "is_stable",
                         "volume",
                         "density",
-                        "band_gap"
+                        "band_gap",
+                        "bulk_modulus",
+                        "shear_modulus"
                     ]
 
                     for i in tqdm(range(0, len(new_ids), CHUNK_SIZE), desc=f"Processing {n}-element materials"):
                         chunk_ids = new_ids[i:i + CHUNK_SIZE]
 
                         try:
+                            # Note: Not all materials have elasticity data computed.
+                            # The summary search will return None or empty dict for missing data.
                             chunk_docs = mpr.materials.summary.search(
                                 material_ids=chunk_ids,
                                 fields=fields
@@ -104,6 +116,31 @@ def fetch_materials():
 
                             data = []
                             for doc in chunk_docs:
+                                # Extract elasticity - robust extraction
+                                k_voigt = None
+                                k_reuss = None
+                                k_vrh = None
+                                g_voigt = None
+                                g_reuss = None
+                                g_vrh = None
+
+                                if doc.bulk_modulus is not None:
+                                    if isinstance(doc.bulk_modulus, dict):
+                                        k_voigt = doc.bulk_modulus.get('voigt')
+                                        k_reuss = doc.bulk_modulus.get('reuss')
+                                        k_vrh = doc.bulk_modulus.get('vrh')
+                                    elif isinstance(doc.bulk_modulus, (int, float)):
+                                        # If it's a single value, assume it's VRH or similar average
+                                        k_vrh = doc.bulk_modulus
+
+                                if doc.shear_modulus is not None:
+                                    if isinstance(doc.shear_modulus, dict):
+                                        g_voigt = doc.shear_modulus.get('voigt')
+                                        g_reuss = doc.shear_modulus.get('reuss')
+                                        g_vrh = doc.shear_modulus.get('vrh')
+                                    elif isinstance(doc.shear_modulus, (int, float)):
+                                        g_vrh = doc.shear_modulus
+
                                 entry = {
                                     "Material ID": str(doc.material_id),
                                     "Formula": doc.formula_pretty,
@@ -113,7 +150,13 @@ def fetch_materials():
                                     "Predicted Stable": doc.is_stable,
                                     "Volume": doc.volume,
                                     "Density": doc.density,
-                                    "Band Gap": doc.band_gap
+                                    "Band Gap": doc.band_gap,
+                                    "Bulk Modulus Voigt": k_voigt,
+                                    "Bulk Modulus Reuss": k_reuss,
+                                    "Bulk Modulus VRH": k_vrh,
+                                    "Shear Modulus Voigt": g_voigt,
+                                    "Shear Modulus Reuss": g_reuss,
+                                    "Shear Modulus VRH": g_vrh
                                 }
                                 data.append(entry)
 
@@ -147,7 +190,9 @@ def finalize_output():
             # Columns requested
             columns = [
                 "Formula", "Sites", "Energy above Hull", "Formation Energy",
-                "Predicted Stable", "Volume", "Density", "Band Gap"
+                "Predicted Stable", "Volume", "Density", "Band Gap",
+                "Bulk Modulus Voigt", "Bulk Modulus Reuss", "Bulk Modulus VRH",
+                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH"
             ]
 
             # Filter columns
