@@ -5,6 +5,7 @@ import time
 from tqdm import tqdm
 import os
 import shutil
+import math
 
 # Configure logging
 logging.basicConfig(
@@ -13,59 +14,62 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default API Key provided in the task description.
-# Ideally, this should be set via environment variable MP_API_KEY.
+# Default API Key
 DEFAULT_API_KEY = "pXWZG9u9gI4oST0zIxDuU6qhA8eHCU26"
 API_KEY = os.environ.get("MP_API_KEY", DEFAULT_API_KEY)
 
-# We use a working file with ID to allow resuming
 WORKING_FILE = "materials_data_working.csv"
 FINAL_OUTPUT_FILE = "materials_data.csv"
-CHUNK_SIZE = 1000  # Number of materials to fetch per detail request
+CHUNK_SIZE = 1000
 
 def fetch_materials():
     """
     Fetches material data from the Materials Project API and saves it to a CSV file.
-    Uses batching by number of elements and then chunking IDs to avoid memory issues.
-    Resume capability added by checking existing Material IDs in the working file.
+    Merges data from Summary and Elasticity endpoints.
     """
     try:
         logger.info("Connecting to Materials Project API...")
 
         existing_ids = set()
 
-        # Check if working file exists to handle headers and resuming
         if os.path.exists(WORKING_FILE):
             logger.info(f"Reading existing data from {WORKING_FILE}...")
             try:
-                # Read only Material ID column to save memory
                 df_existing = pd.read_csv(WORKING_FILE, usecols=["Material ID"])
                 existing_ids = set(df_existing["Material ID"].astype(str))
                 logger.info(f"Found {len(existing_ids)} existing materials.")
             except Exception as e:
                 logger.warning(f"Could not read existing file: {e}. Starting fresh.")
-                # If reading fails, maybe backup and start fresh?
-                # For now, we assume if it fails we might just append or overwrite if empty
         else:
-            # Initialize working file with headers including ID
             headers = [
-                "Material ID", "Formula", "Sites", "Energy above Hull", "Formation Energy",
-                "Predicted Stable", "Volume", "Density", "Band Gap",
+                "Material ID", "Formula", "Energy above Hull", "Formation Energy",
+                "Predicted Stable", "Elastic Constants",
                 "Bulk Modulus Voigt", "Bulk Modulus Reuss", "Bulk Modulus VRH",
-                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH"
+                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH",
+                "Youngs Modulus", "Elastic Anisotropy", "Density", "Volume",
+                "Crystal System", "Band Gap", "Is Metal", "Sites"
             ]
             pd.DataFrame(columns=headers).to_csv(WORKING_FILE, index=False)
 
         with MPRester(API_KEY) as mpr:
             total_fetched = 0
 
-            # Iterate through number of elements (1 to 12)
-            # 12 is a safe upper bound for number of elements in a compound
+            # Summary fields
+            summary_fields = [
+                "material_id", "formula_pretty", "energy_above_hull",
+                "formation_energy_per_atom", "is_stable", "volume",
+                "density", "band_gap", "is_metal", "nsites",
+                "symmetry", "universal_anisotropy", "bulk_modulus", "shear_modulus"
+            ]
+
+            # Elasticity fields
+            elasticity_fields = ["material_id", "elastic_tensor"]
+
             for n in range(1, 13):
                 logger.info(f"Fetching materials with {n} elements...")
 
                 try:
-                    # Fetch IDs only for this group using summary endpoint
+                    # Fetch IDs only first
                     docs = mpr.materials.summary.search(
                         num_elements=(n, n),
                         fields=["material_id"]
@@ -75,7 +79,6 @@ def fetch_materials():
                         continue
 
                     all_ids = [str(doc.material_id) for doc in docs]
-                    # Filter out existing IDs
                     new_ids = [mid for mid in all_ids if mid not in existing_ids]
 
                     if not new_ids:
@@ -84,39 +87,42 @@ def fetch_materials():
 
                     logger.info(f"Found {len(all_ids)} materials, {len(new_ids)} new to fetch.")
 
-                    # Process in chunks
-                    # We need summary fields AND elasticity fields.
-                    # The summary endpoint contains elasticity data in the 'elasticity' field or flattened fields?
-                    # Based on tests, summary doc has `bulk_modulus` and `shear_modulus` as keys which contain the Voigt/Reuss/VRH values in a dictionary.
-
-                    fields = [
-                        "material_id",
-                        "formula_pretty",
-                        "nsites",
-                        "energy_above_hull",
-                        "formation_energy_per_atom",
-                        "is_stable",
-                        "volume",
-                        "density",
-                        "band_gap",
-                        "bulk_modulus",
-                        "shear_modulus"
-                    ]
-
                     for i in tqdm(range(0, len(new_ids), CHUNK_SIZE), desc=f"Processing {n}-element materials"):
                         chunk_ids = new_ids[i:i + CHUNK_SIZE]
 
                         try:
-                            # Note: Not all materials have elasticity data computed.
-                            # The summary search will return None or empty dict for missing data.
-                            chunk_docs = mpr.materials.summary.search(
+                            # 1. Fetch Summary Data
+                            summary_docs = mpr.materials.summary.search(
                                 material_ids=chunk_ids,
-                                fields=fields
+                                fields=summary_fields
                             )
 
+                            # 2. Fetch Elasticity Data for these IDs
+                            # Elasticity endpoint search by material_ids
+                            # Note: Not all materials have elasticity data
+                            elasticity_map = {}
+                            try:
+                                elasticity_docs = mpr.materials.elasticity.search(
+                                    material_ids=chunk_ids,
+                                    fields=elasticity_fields
+                                )
+                                for edoc in elasticity_docs:
+                                    # store elastic_tensor. It might be an object or list.
+                                    # If object, try to convert to list/dict str
+                                    tensor = edoc.elastic_tensor
+                                    if hasattr(tensor, "voigt"):
+                                        # pymatgen tensor object?
+                                        tensor = tensor.voigt.tolist()
+                                    elasticity_map[str(edoc.material_id)] = tensor
+                            except Exception as e:
+                                logger.warning(f"Error fetching elasticity for chunk: {e}")
+                                # Continue without elasticity data
+
                             data = []
-                            for doc in chunk_docs:
-                                # Extract elasticity - robust extraction
+                            for doc in summary_docs:
+                                mid = str(doc.material_id)
+
+                                # Extract elasticity from summary
                                 k_voigt = None
                                 k_reuss = None
                                 k_vrh = None
@@ -130,7 +136,6 @@ def fetch_materials():
                                         k_reuss = doc.bulk_modulus.get('reuss')
                                         k_vrh = doc.bulk_modulus.get('vrh')
                                     elif isinstance(doc.bulk_modulus, (int, float)):
-                                        # If it's a single value, assume it's VRH or similar average
                                         k_vrh = doc.bulk_modulus
 
                                 if doc.shear_modulus is not None:
@@ -141,22 +146,46 @@ def fetch_materials():
                                     elif isinstance(doc.shear_modulus, (int, float)):
                                         g_vrh = doc.shear_modulus
 
+                                # Calculate Young's Modulus (Hill average assumption usually)
+                                # E = 9KG / (3K + G)
+                                youngs = None
+                                if k_vrh and g_vrh:
+                                    if (3 * k_vrh + g_vrh) != 0:
+                                        youngs = (9 * k_vrh * g_vrh) / (3 * k_vrh + g_vrh)
+
+                                # Crystal system
+                                crystal_sys = None
+                                if doc.symmetry:
+                                    # symmetry is an object
+                                    if hasattr(doc.symmetry, 'crystal_system'):
+                                         crystal_sys = str(doc.symmetry.crystal_system)
+                                    else:
+                                         crystal_sys = str(doc.symmetry) # Fallback
+
+                                # Elastic Tensor
+                                e_tensor = elasticity_map.get(mid)
+
                                 entry = {
-                                    "Material ID": str(doc.material_id),
+                                    "Material ID": mid,
                                     "Formula": doc.formula_pretty,
-                                    "Sites": doc.nsites,
                                     "Energy above Hull": doc.energy_above_hull,
                                     "Formation Energy": doc.formation_energy_per_atom,
                                     "Predicted Stable": doc.is_stable,
-                                    "Volume": doc.volume,
-                                    "Density": doc.density,
-                                    "Band Gap": doc.band_gap,
+                                    "Elastic Constants": str(e_tensor) if e_tensor else None,
                                     "Bulk Modulus Voigt": k_voigt,
                                     "Bulk Modulus Reuss": k_reuss,
                                     "Bulk Modulus VRH": k_vrh,
                                     "Shear Modulus Voigt": g_voigt,
                                     "Shear Modulus Reuss": g_reuss,
-                                    "Shear Modulus VRH": g_vrh
+                                    "Shear Modulus VRH": g_vrh,
+                                    "Youngs Modulus": youngs,
+                                    "Elastic Anisotropy": doc.universal_anisotropy,
+                                    "Density": doc.density,
+                                    "Volume": doc.volume,
+                                    "Crystal System": crystal_sys,
+                                    "Band Gap": doc.band_gap,
+                                    "Is Metal": doc.is_metal,
+                                    "Sites": doc.nsites
                                 }
                                 data.append(entry)
 
@@ -173,7 +202,6 @@ def fetch_materials():
 
             logger.info(f"Done fetching. Total fetched in this run: {total_fetched}.")
 
-            # Finalize: Create the requested output file without Material ID
             finalize_output()
 
     except Exception as e:
@@ -184,18 +212,20 @@ def finalize_output():
     logger.info(f"Creating final output file {FINAL_OUTPUT_FILE}...")
     try:
         if os.path.exists(WORKING_FILE):
-             # Read iterator to handle large files if necessary, but here we just read all
             df = pd.read_csv(WORKING_FILE)
 
-            # Columns requested
             columns = [
-                "Formula", "Sites", "Energy above Hull", "Formation Energy",
-                "Predicted Stable", "Volume", "Density", "Band Gap",
+                "Material ID", "Formula", "Energy above Hull", "Formation Energy",
+                "Predicted Stable", "Elastic Constants",
                 "Bulk Modulus Voigt", "Bulk Modulus Reuss", "Bulk Modulus VRH",
-                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH"
+                "Shear Modulus Voigt", "Shear Modulus Reuss", "Shear Modulus VRH",
+                "Youngs Modulus", "Elastic Anisotropy", "Density", "Volume",
+                "Crystal System", "Band Gap", "Is Metal", "Sites"
             ]
 
-            # Filter columns
+            # The user requested specific fields. "material id" was requested this time!
+            # "- material id" ...
+
             if all(col in df.columns for col in columns):
                 df_final = df[columns]
                 df_final.to_csv(FINAL_OUTPUT_FILE, index=False)
